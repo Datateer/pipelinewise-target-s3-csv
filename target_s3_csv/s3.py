@@ -78,19 +78,16 @@ class S3MultipartUploader(object):
     def __init__(self,
                  config, # the singer config object
                  stream_name,  # the name of the singer stream
-                #  upload_batch_size=int(15e6),
+                 s3_key,
                  include_header_row=True,
                  profile_name=None,  # the AWS profile name
-                 # the size in number of records for how big a batch should be before uploading
                  region_name='us-east-1',  # the AWS region
-                 timestamp=None,
                  verbose=False):
         self.bucket = config['s3_bucket']
+        self.key = s3_key
         self.csv_delimiter = config.get('delimiter', ',')
         self.csv_quotechar = config.get('quotechar', '"')
         self.include_header_row = include_header_row # todo: consider including in config, or remove
-        self.timestamp = timestamp or datetime.now().strftime('%Y%m%dT%H%M%S')
-        self.key = f'{config.get("s3_key", "")}{stream_name}_{self.timestamp}.csv'
         self.part_records = int(config.get('upload_batch_record_count', 100000))
         self.s3 = boto3.client('s3', config=Config(signature_version='s3v4'))
         if verbose:

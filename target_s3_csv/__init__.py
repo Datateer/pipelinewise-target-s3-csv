@@ -236,7 +236,8 @@ def main():
     processed_message_stream = process_message_stream(input_message_stream, config)
     for (stream_name, record) in processed_message_stream:
         if stream_name not in uploaders:
-            uploaders[stream_name] = s3.S3MultipartUploader(config, stream_name)
+            s3_key = utils.get_target_key(stream_name, prefix=config.get('s3_key_prefix', ''), timestamp=now, naming_convention=config.get('naming_convention'))
+            uploaders[stream_name] = s3.S3MultipartUploader(config, stream_name, s3_key)
         uploaders[stream_name].add_record(record)
     for u in uploaders.values():
         u.complete()
