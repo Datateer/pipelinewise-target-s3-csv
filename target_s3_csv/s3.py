@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import csv
 from datetime import datetime
+import json
 import io
 import os
 import sys
@@ -8,14 +9,21 @@ import tempfile
 import time
 
 import boto3
+
+import gzip
+import os
+import shutil
 import backoff
 import boto3
 import singer
+
+from typing import Optional, Tuple, List, Dict, Iterator
+from botocore.client import BaseClient
 from botocore.client import Config
 from botocore.exceptions import ClientError
 import humanize
 
-LOGGER = singer.get_logger('target_s3_csv')
+LOGGER = singer.get_logger()
 
 
 def retry_pattern():
@@ -28,48 +36,6 @@ def retry_pattern():
 
 def log_backoff_attempt(details):
     LOGGER.info("Error detected communicating with Amazon, triggering backoff: %d try", details.get("tries"))
-
-@retry_pattern()
-def setup_aws_client(config):
-    aws_access_key_id = config['aws_access_key_id']
-    aws_secret_access_key = config['aws_secret_access_key']
-
-    LOGGER.info("Attempting to create AWS session")
-    boto3.setup_default_session(aws_access_key_id=aws_access_key_id,
-                                aws_secret_access_key=aws_secret_access_key)
-
-@retry_pattern()
-def upload_file(filename, bucket, s3_key,
-                encryption_type=None, encryption_key=None):
-    s3_client = boto3.client('s3', config=Config(signature_version='s3v4'))
-    # s3_key = "{}{}".format(key_prefix, os.path.basename(filename))
-
-    if encryption_type is None or encryption_type.lower() == "none":
-        # No encryption config (defaults to settings on the bucket):
-        encryption_desc = ""
-        encryption_args = None
-    else:
-        if encryption_type.lower() == "kms":
-            encryption_args = {"ServerSideEncryption": "aws:kms"}
-            if encryption_key:
-                encryption_desc = (
-                    " using KMS encryption key ID '{}'"
-                    .format(encryption_key)
-                )
-                encryption_args["SSEKMSKeyId"] = encryption_key
-            else:
-                encryption_desc = " using default KMS encryption"
-        else:
-            raise NotImplementedError(
-                "Encryption type '{}' is not supported. "
-                "Expected: 'none' or 'KMS'"
-                .format(encryption_type)
-            )
-    LOGGER.info(
-        "Uploading {} to bucket {} at {}{}"
-        .format(filename, bucket, s3_key, encryption_desc)
-    )
-    s3_client.upload_file(filename, bucket, s3_key, ExtraArgs=encryption_args)
 
 class S3MultipartUploader(object):
     # AWS throws EntityTooSmall error for parts smaller than 5 MB
@@ -89,7 +55,8 @@ class S3MultipartUploader(object):
         self.csv_quotechar = config.get('quotechar', '"')
         self.include_header_row = include_header_row # todo: consider including in config, or remove
         self.part_records = int(config.get('upload_batch_record_count', 100000))
-        self.s3 = boto3.client('s3', config=Config(signature_version='s3v4'))
+        session = boto3.Session(aws_access_key_id=config.get('aws_access_key_id') or os.getenv('AWS_ACCESS_KEY_ID'),aws_secret_access_key=config.get('aws_secret_access_key') or os.getenv('AWS_SECRET_ACCESS_KEY'))
+        self.s3 = session.client('s3', config=Config(signature_version='s3v4'))
         if verbose:
             boto3.set_stream_logger(name="botocore")
         mpu = self.s3.create_multipart_upload(Bucket=self.bucket, Key=self.key)
@@ -114,14 +81,20 @@ class S3MultipartUploader(object):
         return aborted
 
     def add_record(self, record):
+        """Returns tuple of bool: did_flush_records_to_target, int: record_count"""
         self.records.append(record)
         self.total_records += 1
         # LOGGER.info(f'added record {self.total_records}')
         if len(self.records) >= self.part_records:
+            record_count = len(self.records)
             self.upload()
+            return True, len(record_count)
+        else:
+            return False, None
+
 
     @retry_pattern()
-    def upload(self):
+    def upload(self, state=None):
         if 0 == len(self.records):
             LOGGER.warn('Nothing to upload')
         part_number = len(self.parts) + 1
@@ -149,8 +122,10 @@ class S3MultipartUploader(object):
         return buffer.getvalue().encode('utf-8')
 
 
+
+
     @retry_pattern()
-    def complete(self,):
+    def complete(self):
         if (self.records): # flush any records yet to be uploaded
             self.upload()
 
@@ -162,3 +137,48 @@ class S3MultipartUploader(object):
             UploadId=self.mpu_id,
             MultipartUpload={"Parts": self.parts})
         return result
+# =======
+
+# def upload_files(filenames: Iterator[Dict],
+#                  s3_client: BaseClient,
+#                  s3_bucket: str,
+#                  compression: Optional[str],
+#                  encryption_type: Optional[str],
+#                  encryption_key: Optional[str]):
+#     """
+#     Uploads given local files to s3
+#     Compress if necessary
+#     """
+#     for file in filenames:
+#         filename, target_key = file['filename'], file['target_key']
+#         compressed_file = None
+
+#         if compression is not None and compression.lower() != "none":
+#             if compression == "gzip":
+#                 compressed_file = f"{filename}.gz"
+#                 target_key = f'{target_key}.gz'
+
+#                 with open(filename, 'rb') as f_in:
+#                     with gzip.open(compressed_file, 'wb') as f_out:
+#                         LOGGER.info(f"Compressing file as '%s'", compressed_file)
+#                         shutil.copyfileobj(f_in, f_out)
+
+#             else:
+#                 raise NotImplementedError(
+#                     "Compression type '{}' is not supported. Expected: 'none' or 'gzip'".format(compression)
+#                 )
+
+#         upload_file(compressed_file or filename,
+#                     s3_client,
+#                     s3_bucket,
+#                     target_key,
+#                     encryption_type=encryption_type,
+#                     encryption_key=encryption_key
+#                     )
+
+#         # Remove the local file(s)
+#         if os.path.exists(filename):
+#             os.remove(filename)
+#             if compressed_file:
+#                 os.remove(compressed_file)
+
