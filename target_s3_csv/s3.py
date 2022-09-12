@@ -79,7 +79,7 @@ class S3MultipartUploader(object):
                     self.s3.abort_multipart_upload(
                         Bucket=self.bucket, Key=self.key, UploadId=upload_id))
         return aborted
-
+    
     def add_record(self, record):
         """Returns tuple of bool: did_flush_records_to_target, int: record_count"""
         self.records.append(record)
@@ -129,13 +129,23 @@ class S3MultipartUploader(object):
         if (self.records): # flush any records yet to be uploaded
             self.upload()
 
+        result = None
+        try:
+            result = self.s3.complete_multipart_upload(
+                Bucket=self.bucket,
+                Key=self.key,
+                UploadId=self.mpu_id,
+                MultipartUpload={"Parts": self.parts})
+        except ClientError as ex:
+            if ex.response['Error']['Code'] == 'EntityTooSmall':
+                self.s3.abort_multipart_upload(Bucket=self.bucket, Key=self.key, UploadId=self.mpu_id)
+                data = self.transform_to_csv(self.records)
+                self.s3.put_object(Body=data, Bucket=self.bucket, Key=self.key)
+            else: 
+                raise
         LOGGER.info(
             f'Finished multipart S3 upload. {len(self.parts)} parts, {humanize.intcomma(self.total_records)} records, {humanize.naturalsize(self.total_bytes, binary=True)} bytes')
-        result = self.s3.complete_multipart_upload(
-            Bucket=self.bucket,
-            Key=self.key,
-            UploadId=self.mpu_id,
-            MultipartUpload={"Parts": self.parts})
+
         return result
 # =======
 
