@@ -8,6 +8,8 @@ import json
 import os
 import shutil
 import sys
+from datetime import datetime
+import time
 import tempfile
 import singer
 
@@ -17,8 +19,7 @@ from jsonschema import Draft7Validator, FormatChecker
 from target_s3_csv import s3
 from target_s3_csv import utils
 
-logger = singer.get_logger('target_s3_csv')
-
+logger = singer.get_logger()
 
 def emit_state(state):
     if state is not None:
@@ -29,8 +30,7 @@ def emit_state(state):
 
 
 # pylint: disable=too-many-locals,too-many-branches,too-many-statements
-def persist_messages(messages, config, s3_client):
-    state = None
+def process_message_stream(input_message_stream, config):
     schemas = {}
     key_properties = {}
     headers = {}
@@ -38,20 +38,15 @@ def persist_messages(messages, config, s3_client):
 
     delimiter = config.get('delimiter', ',')
     quotechar = config.get('quotechar', '"')
-
-    # Use the system specific temp directory if no custom temp_dir provided
-    temp_dir = os.path.expanduser(config.get('temp_dir', tempfile.gettempdir()))
-
-    # Create temp_dir if not exists
-    if temp_dir:
-        os.makedirs(temp_dir, exist_ok=True)
-
-    # dictionary to hold csv filename per stream
-    filenames = {}
-
     now = datetime.now().strftime('%Y%m%dT%H%M%S')
 
-    for message in messages:
+    for message in iter(input_message_stream):
+        try:
+            o = singer.parse_message(message).asdict()
+        except json.decoder.JSONDecodeError:
+            logger.error("Unable to parse:\n{}".format(message))
+            raise
+        message_type = o['type']
         try:
             o = singer.parse_message(message).asdict()
         except json.decoder.JSONDecodeError:
@@ -81,48 +76,13 @@ def persist_messages(messages, config, s3_client):
             else:
                 record_to_load = utils.remove_metadata_values_from_record(o)
 
-            if stream_name not in filenames:
-                filename = os.path.expanduser(os.path.join(temp_dir, stream_name + '-' + now + '.csv'))
-
-                filenames[stream_name] = {
-                    'filename': filename,
-                    'target_key': utils.get_target_key(message=o,
-                                                       prefix=config.get('s3_key_prefix', ''),
-                                                       timestamp=now,
-                                                       naming_convention=config.get('naming_convention'))
-
-                }
-            else:
-                filename = filenames[stream_name]['filename']
-
-            file_is_empty = (not os.path.isfile(filename)) or os.stat(filename).st_size == 0
-
             flattened_record = utils.flatten_record(record_to_load)
-
-            if stream_name not in headers and not file_is_empty:
-                with open(filename, 'r') as csvfile:
-                    reader = csv.reader(csvfile,
-                                        delimiter=delimiter,
-                                        quotechar=quotechar)
-                    first_line = next(reader)
-                    headers[stream_name] = first_line if first_line else flattened_record.keys()
-            else:
-                headers[stream_name] = flattened_record.keys()
-
-            with open(filename, 'a') as csvfile:
-                writer = csv.DictWriter(csvfile,
-                                        headers[stream_name],
-                                        extrasaction='ignore',
-                                        delimiter=delimiter,
-                                        quotechar=quotechar)
-                if file_is_empty:
-                    writer.writeheader()
-
-                writer.writerow(flattened_record)
+            yield (o['stream'], flattened_record, message_type)
 
         elif message_type == 'STATE':
-            logger.debug('Setting state to {}'.format(o['value']))
-            state = o['value']
+            logger.info(f'Received state from tap: {o["value"]}')
+            yield(None, o, message_type)
+            # logger.info('Setting state to {}'.format(o['value']))
 
         elif message_type == 'SCHEMA':
             stream_name = o['stream']
@@ -139,14 +99,10 @@ def persist_messages(messages, config, s3_client):
         else:
             logger.warning("Unknown message type {} in message {}".format(o['type'], o))
 
-    # Upload created CSV files to S3
-    s3.upload_files(iter(filenames.values()), s3_client, config['s3_bucket'], config.get("compression"),
-                    config.get('encryption_type'), config.get('encryption_key'))
-
-    return state
-
+    
 
 def main():
+    now = datetime.now().strftime('%Y%m%dT%H%M%S')
     parser = argparse.ArgumentParser()
     parser.add_argument('-c', '--config', help='Config file')
     args = parser.parse_args()
@@ -162,12 +118,29 @@ def main():
         logger.error("Invalid configuration:\n   * {}".format('\n   * '.join(config_errors)))
         sys.exit(1)
 
-    s3_client = s3.create_client(config)
+    # s3.setup_aws_client(config)
 
-    input_messages = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
-    state = persist_messages(input_messages, config, s3_client)
+    uploaders = {}
+    input_message_stream = io.TextIOWrapper(sys.stdin.buffer, encoding='utf-8')
+    processed_message_stream = process_message_stream(input_message_stream, config)
+    state_from_tap = None
+    try:
+        for (stream_name, record, message_type) in processed_message_stream:
+            if message_type == 'STATE':
+                state_from_tap = record
+            elif message_type == 'RECORD':
+                if stream_name not in uploaders:
+                    s3_key = utils.get_target_key(stream_name, prefix=config.get('s3_key_prefix', ''), timestamp=now, naming_convention=config.get('naming_convention'))
+                    uploaders[stream_name] = s3.S3MultipartUploader(config, stream_name, s3_key)
+                did_flush_records_to_target, record_count = uploaders[stream_name].add_record(record)
+                if did_flush_records_to_target and state_from_tap is not None:
+                    emit_state(state_from_tap)
+    finally:
+        for u in uploaders.values():
+            u.complete()
+        if state_from_tap is not None:
+            emit_state(state_from_tap)
 
-    emit_state(state)
     logger.debug("Exiting normally")
 
 

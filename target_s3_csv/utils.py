@@ -9,7 +9,7 @@ from decimal import Decimal
 from datetime import datetime
 from collections.abc import MutableMapping
 
-logger = singer.get_logger('target_s3_csv')
+logger = singer.get_logger()
 
 
 def validate_config(config):
@@ -122,7 +122,7 @@ def flatten_record(d, parent_key=None, sep='__'):
     return dict(items)
 
 
-def get_target_key(message, prefix=None, timestamp=None, naming_convention=None):
+def get_target_key(stream_name, prefix=None, timestamp=None, naming_convention=None):
     """Creates and returns an S3 key for the message"""
     if not naming_convention:
         naming_convention = '{stream}-{timestamp}.csv' # o['stream'] + '-' + now + '.csv'
@@ -132,7 +132,7 @@ def get_target_key(message, prefix=None, timestamp=None, naming_convention=None)
     
     # replace simple tokens
     for k, v in {
-        '{stream}': message['stream'],
+        '{stream}': stream_name,
         '{timestamp}': timestamp,
         '{date}': datetime.now().strftime('%Y-%m-%d')
     }.items():
