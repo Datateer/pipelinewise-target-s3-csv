@@ -88,7 +88,7 @@ class S3MultipartUploader(object):
         if len(self.records) >= self.part_records:
             record_count = len(self.records)
             self.upload()
-            return True, len(record_count)
+            return True, record_count
         else:
             return False, None
 
