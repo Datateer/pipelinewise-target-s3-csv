@@ -27,7 +27,7 @@ setup(name="pipelinewise-target-s3-csv",
           'inflection==0.5.1',
           'jsonschema==3.2.0',
           'humanize==2.5.0',
-          'boto3==1.24.70',
+          'boto3==1.26.75',
       ],
       extras_require={
           "test": [
